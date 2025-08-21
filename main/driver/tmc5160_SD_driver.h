@@ -38,7 +38,7 @@
 #define CW_DIR 0
 #define CCW_DIR 1
 
-#define MICROSTEPS 32
+#define MICROSTEPS 16
 
 #define RPM_MAX 900.0f               // max RPM before wrap
 #define RPM_MIN 0.0f              // min RPM before wrap
