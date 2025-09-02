@@ -13,28 +13,33 @@ static void button_event_cb(void *arg, void *usr_data) {
     switch (gpio_num) {
         case BOOT_BUTTON_PIN:
         if (event == BUTTON_SINGLE_CLICK) {
-            // +60 RPM (wrap), 즉시 반영
-            float next = g_target_rpm + RPM_STEP;
-            if (next > RPM_MAX) next = RPM_MAX;
-            set_target_rpm(next);
-            ESP_LOGI(TAG, "RPM -> %.1f (Step Period: %lu µs)", (double)g_target_rpm, get_current_step_period());
+            toggle_direction();
         } else if (event == BUTTON_DOUBLE_CLICK) {
-            // TOFF 레벨 토글 (12 -> 16 -> 20 -> 12)
-            toggle_toff_level();
         }
         break;
-        case SUB_BUTTON_PIN:
+        case SUB_BUTTON_PIN_1:
+        if (event == BUTTON_SINGLE_CLICK) {
+            // +60 RPM (wrap), 즉시 반영
+            float next = g_target_rpm_1 + RPM_STEP;
+            if (next > RPM_MAX) next = RPM_MAX;
+            set_target_rpm(MOTOR_1, next);
+            ESP_LOGI(TAG, "RPM -> %.1f (Step Period: %lu µs)", (double)g_target_rpm_1, get_current_step_period(MOTOR_1));
+        } else if (event == BUTTON_DOUBLE_CLICK) {
+            for (int i = 0; i < 5; i++) {
+                motor_precise_test_sequence();
+            }
+            set_target_rpm(MOTOR_1, 0);
+        }
+        break;
+        case SUB_BUTTON_PIN_2:
         if (event == BUTTON_SINGLE_CLICK) {
             // -60 RPM (wrap), 즉시 반영
-            float next = g_target_rpm - RPM_STEP;
+            float next = g_target_rpm_1 - RPM_STEP;
             if (next <= RPM_MIN) next = RPM_MIN;
-            set_target_rpm(next);
-            ESP_LOGI(TAG, "RPM -> %.1f (Step Period: %lu µs)", (double)g_target_rpm, get_current_step_period());
+            set_target_rpm(MOTOR_1, next);
+            ESP_LOGI(TAG, "RPM -> %.1f (Step Period: %lu µs)", (double)g_target_rpm_1, get_current_step_period(MOTOR_1));
         } else if (event == BUTTON_DOUBLE_CLICK) {
-            // 히스테리시스 레벨 토글 (HSTRT/HEND 조정)
-            // toggle_hysteresis_level();
-            set_current_level(1.0f, 0.5f);
-            // toggle_bbmtime_level();
+            motor_step_acceleration_test_sequence();
         }
         break;
         default:
@@ -51,36 +56,28 @@ static void button_long_press_event_cb(void *arg, void *usr_data) {
         case BOOT_BUTTON_PIN:
         // 길게 누름 시작에서만 토글 (한 번만 실행)
         if (event == BUTTON_LONG_PRESS_START) {
-            if (g_run_enabled) {
-                stepper_stop_continuous();
+            if (g_run_enabled_1) {
+                stepper_stop_continuous(MOTOR_1);
+                break_control(0);
                 ESP_LOGI(TAG, "STOP");
             } else {
-                gpio_set_level(RELAY_BREAK_A_PIN, 1);
-                vTaskDelay(pdMS_TO_TICKS(100));
-                stepper_start_continuous(1);
+                break_control(1);
+                stepper_start_continuous(MOTOR_1, CW_DIR);
                 ESP_LOGI(TAG, "START");
             }
         }
         break;
-        case SUB_BUTTON_PIN:
+        case SUB_BUTTON_PIN_1:
         if (event == BUTTON_LONG_PRESS_START) {
-            // if (g_run_enabled) {
-            //     stepper_stop_continuous();
-            //     vTaskDelay(ms_to_ticks(100));
-            //     gpio_set_level(RELAY_BREAK_A_PIN, 0);
-            //     ESP_LOGI(TAG, "STOP");
-            // } else {
-            //     gpio_set_level(RELAY_BREAK_A_PIN, 1);
-            //     vTaskDelay(ms_to_ticks(100));
-            //     stepper_start_continuous(1);
-            //     ESP_LOGI(TAG, "START");
-            // }
+        }
+        break;
+        case SUB_BUTTON_PIN_2:
+        if (event == BUTTON_LONG_PRESS_START) {
         }
         break;
         default:
             break;
     }
-
 }
 
 static void iot_button_init(uint32_t button_num) {
@@ -106,6 +103,10 @@ void button_init() {
     gpio_set_direction(SUB_BUTTON_VCC_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(SUB_BUTTON_VCC_PIN, 1);
 
+    gpio_set_direction(SUB_BUTTON_GND_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(SUB_BUTTON_GND_PIN, 0);
+
     iot_button_init(BOOT_BUTTON_PIN);
-    iot_button_init(SUB_BUTTON_PIN);
+    iot_button_init(SUB_BUTTON_PIN_1);
+    iot_button_init(SUB_BUTTON_PIN_2);
 }
