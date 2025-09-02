@@ -3,15 +3,23 @@
 static spi_device_handle_t tmc_spi = NULL;
 
 // --- Hardware step generation (GPTimer) ---
-static gptimer_handle_t step_timer = NULL;
-static SemaphoreHandle_t step_done_sem = NULL; // given on each completed step (falling edge)
-static volatile int32_t hw_steps_remaining = 0;
-static volatile uint32_t hw_current_period_us = 100; // full period per step (µs)
-static volatile bool hw_step_state_high = false;      // current level of STEP pin
-static volatile bool g_stop_requested = false;        // request to stop mid-motion
+static gptimer_handle_t step_timer_1 = NULL;
+static SemaphoreHandle_t step_done_sem_1 = NULL; // given on each completed step (falling edge)
+static volatile int32_t hw_steps_remaining_1 = 0;
+static volatile uint32_t hw_current_period_us_1 = 100; // full period per step (µs)
+static volatile bool hw_step_state_high_1 = false;      // current level of STEP pin
+static volatile bool g_stop_requested_1 = false;        // request to stop mid-motion
+volatile bool g_run_enabled_1 = false;           // continuous run flag
+volatile float g_target_rpm_1 = 0.0f;           // current target RPM (continuous)
 
-volatile bool g_run_enabled = false;           // continuous run flag
-volatile float g_target_rpm = 0.0f;           // current target RPM (continuous)
+static gptimer_handle_t step_timer_2 = NULL;
+static SemaphoreHandle_t step_done_sem_2 = NULL; // given on each completed step (falling edge)
+static volatile int32_t hw_steps_remaining_2 = 0;
+static volatile uint32_t hw_current_period_us_2 = 100; // full period per step (µs)
+static volatile bool hw_step_state_high_2 = false;      // current level of STEP pin
+static volatile bool g_stop_requested_2 = false;        // request to stop mid-motion
+volatile bool g_run_enabled_2 = false;           // continuous run flag
+volatile float g_target_rpm_2 = 0.0f;           // current target RPM (continuous)
 
 static volatile int dir_level = CW_DIR;
 static volatile int bbmtime_level = 2; // 현재 BBMTIME 값 (더 극적인 시작값)
@@ -19,6 +27,11 @@ static volatile int hstrt_level = 2; // 현재 HSTRT 값 (최적값으로 변경
 static volatile int hend_level = 2; // 현재 HEND 값 (최적값으로 변경)
 static volatile int toff_level = 8; // 현재 TOFF 값 (안전한 시작값)
 static volatile int g_microsteps = MICROSTEPS; // 헤더에서 정의된 마이크로스텝 값 사용 (런타임 동기화용)
+
+// 현재 모터 위치 (스텝 단위)
+static volatile int g_current_position = 0;
+
+static int current_dir = CW_DIR;
 
 static const char *TAG = "TMC5160";
 
@@ -173,43 +186,43 @@ static inline uint32_t rpm_to_period_us(float rpm) {
     return us;
 }
 
-static bool IRAM_ATTR step_timer_isr(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
+static bool IRAM_ATTR step_timer_isr_1(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
     // Toggle STEP pin every alarm (half-period)
-    hw_step_state_high = !hw_step_state_high;
-    gpio_set_level(REFL_STEP, hw_step_state_high ? 1 : 0);
+    hw_step_state_high_1 = !hw_step_state_high_1;
+    gpio_set_level(REFL_STEP_1, hw_step_state_high_1 ? 1 : 0);
 
     bool request_yield = false;
 
     // On falling edge, one full step completed
-    if (!hw_step_state_high) {
+    if (!hw_step_state_high_1) {
         // If continuous run was disabled, stop immediately at this safe edge
-        if (!g_run_enabled) {
+        if (!g_run_enabled_1) {
             gptimer_stop(timer);
             BaseType_t hpw = pdFALSE;
-            if (step_done_sem) xSemaphoreGiveFromISR(step_done_sem, &hpw);
+            if (step_done_sem_1) xSemaphoreGiveFromISR(step_done_sem_1, &hpw);
             request_yield = (hpw == pdTRUE);
             return request_yield;
         }
-        if (hw_steps_remaining > 0) {
-            hw_steps_remaining--;
+        if (hw_steps_remaining_1 > 0) {
+            hw_steps_remaining_1--;
         }
-        if (hw_steps_remaining == 0) {
+        if (hw_steps_remaining_1 == 0) {
             // Stop timer; no more alarms
             gptimer_stop(timer);
             // Notify waiter one last time so the task can proceed
             BaseType_t hpw = pdFALSE;
-            if (step_done_sem) xSemaphoreGiveFromISR(step_done_sem, &hpw);
+            if (step_done_sem_1) xSemaphoreGiveFromISR(step_done_sem_1, &hpw);
             request_yield = (hpw == pdTRUE);
             return request_yield;
         }
         // Notify task that a step has completed
         BaseType_t hpw = pdFALSE;
-        if (step_done_sem) xSemaphoreGiveFromISR(step_done_sem, &hpw);
+        if (step_done_sem_1) xSemaphoreGiveFromISR(step_done_sem_1, &hpw);
         request_yield = (hpw == pdTRUE);
     }
 
     // Schedule next half-period alarm (simplified)
-    uint64_t next_delta_us = (uint64_t)(hw_current_period_us >> 1);
+    uint64_t next_delta_us = (uint64_t)(hw_current_period_us_1 >> 1);
     if (next_delta_us < 10) next_delta_us = 10; // Minimum 10µs for safety
     gptimer_alarm_config_t alarm_cfg = {
         .alarm_count = edata->alarm_value + next_delta_us,
@@ -220,13 +233,12 @@ static bool IRAM_ATTR step_timer_isr(gptimer_handle_t timer, const gptimer_alarm
     return request_yield;
 }
 
-static void stepper_timer_init_once(void)
-{
-    if (step_timer) return;
+static void stepper_timer_init_once_1(void) {
+    if (step_timer_1) return;
 
     // Create semaphore
-    if (step_done_sem == NULL) {
-        step_done_sem = xSemaphoreCreateBinary();
+    if (step_done_sem_1 == NULL) {
+        step_done_sem_1 = xSemaphoreCreateBinary();
     }
 
     gptimer_config_t cfg = {
@@ -234,13 +246,13 @@ static void stepper_timer_init_once(void)
         .direction = GPTIMER_COUNT_UP,
         .resolution_hz = 1000000, // 1 MHz -> 1 tick = 1 µs (safe resolution)
     };
-    ESP_ERROR_CHECK(gptimer_new_timer(&cfg, &step_timer));
+    ESP_ERROR_CHECK(gptimer_new_timer(&cfg, &step_timer_1));
 
     gptimer_event_callbacks_t cbs = {
-        .on_alarm = step_timer_isr,
+        .on_alarm = step_timer_isr_1,
     };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(step_timer, &cbs, NULL));
-    ESP_ERROR_CHECK(gptimer_enable(step_timer));
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(step_timer_1, &cbs, NULL));
+    ESP_ERROR_CHECK(gptimer_enable(step_timer_1));
 }
 
 void set_hysteresis_level(int hstrt, int hend) {
@@ -314,8 +326,15 @@ int get_current_microsteps(void) {
 }
 
 // 현재 스텝 주기 값 반환 (µs)
-uint32_t get_current_step_period(void) {
-    return hw_current_period_us;
+uint32_t get_current_step_period(int motor_num) {
+    if (motor_num == MOTOR_1) {
+        return hw_current_period_us_1;
+    } else if (motor_num == MOTOR_2) {
+        return hw_current_period_us_2;
+    } else {
+        ESP_LOGI(TAG, "Invalid motor number: %d", motor_num);
+        return 0;
+    }
 }
 
 void set_current_level(float irun_current, float ihold_current) {
@@ -434,88 +453,180 @@ static void set_adjust(float rpm) {
     if (rpm <= 60.0f) {
         // 낮은 속도: 높은 토크 필요 (가속, 정지 시)
         hstrt = 2; hend = 2;
-        irun_current = 1.8f;  // 높은 전류: 토크 부족 방지
+        irun_current = 2.8f;  // 높은 전류: 토크 부족 방지
         ihold_current = 0.5f; // 홀드 토크도 높게
     } else if (rpm >= 60.0f && rpm <= 120.0f) {
         // 중간 속도: 균형 설정
         hstrt = 3; hend = 1;
-        irun_current = 1.6f;  // 중간 전류: 안정적 구동
-        ihold_current = 0.4f;
+        irun_current = 2.7f;  // 중간 전류: 안정적 구동
+        ihold_current = 0.5f;
     } else if (rpm >= 120.0f && rpm <= 240.0f) {
         // 높은 속도: 관성으로 회전, 낮은 토크
         hstrt = 4; hend = 1;
-        irun_current = 1.4f;  // 낮은 전류: 전력 절약
-        ihold_current = 0.3f; // 홀드 전류도 낮게
+        irun_current = 2.6f;  // 낮은 전류: 전력 절약
+        ihold_current = 0.5f; // 홀드 전류도 낮게
     } else if (rpm >= 240.0f && rpm <= 360.0f) {
         hstrt = 5; hend = 1;
-        irun_current = 1.2f;  // 낮은 전류: 전력 절약
-        ihold_current = 0.2f; // 홀드 전류도 낮게
+        irun_current = 2.5f;  // 낮은 전류: 전력 절약
+        ihold_current = 0.5f; // 홀드 전류도 낮게
     } else if (rpm >= 360.0f && rpm <= 480.0f) {
         hstrt = 6; hend = 1;
-        irun_current = 1.2f;  // 최소 전류 보장
-        ihold_current = 0.3f; // 홀드 전류도 보장
+        irun_current = 2.4f;  // 최소 전류 보장
+        ihold_current = 0.5f; // 홀드 전류도 보장
     } else {
         hstrt = 7; hend = 1;
-        irun_current = 1.0f;  // 최소 전류 보장
-        ihold_current = 0.2f; // 홀드 전류도 보장
+        irun_current = 2.3f;  // 최소 전류 보장
+        ihold_current = 0.5f; // 홀드 전류도 보장
     }
     set_hysteresis_level(hstrt, hend);
     set_current_level(irun_current, ihold_current);
     
 }
 
-void set_target_rpm(float rpm)
-{
+void set_target_rpm(int motor_num, float rpm) {
     if (rpm < RPM_STEP) rpm = RPM_MIN;
     if (rpm > RPM_MAX) rpm = RPM_MAX;
-    g_target_rpm = rpm;
-    hw_current_period_us = rpm_to_period_us(rpm);
+    if (motor_num == MOTOR_1) {
+        g_target_rpm_1 = rpm;
+    } else if (motor_num == MOTOR_2) {
+        g_target_rpm_2 = rpm;
+    } else {
+        ESP_LOGI(TAG, "Invalid motor number: %d", motor_num);
+        return;
+    }
+    if (motor_num == MOTOR_1) {
+        hw_current_period_us_1 = rpm_to_period_us(rpm);
+    } else if (motor_num == MOTOR_2) {
+        hw_current_period_us_2 = rpm_to_period_us(rpm);
+    } else {
+        ESP_LOGI(TAG, "Invalid motor number: %d", motor_num);
+        return;
+    }
     
     // 속도에 따른 자동 조정
     set_adjust(rpm);
 }
 
-void stepper_start_continuous(int dir)
-{
-    stepper_timer_init_once();
-    gpio_set_level(REFR_DIR, dir ? 1 : 0);
-    gpio_set_level(REFL_STEP, 0);
-    hw_step_state_high = false;
-    hw_steps_remaining = -1; // continuous
-    g_run_enabled = true;
-
-    uint64_t now = 0;
-    ESP_ERROR_CHECK(gptimer_get_raw_count(step_timer, &now));
-    uint64_t half = (uint64_t)(hw_current_period_us >> 1);
-    if (half == 0) half = 1;
-    gptimer_alarm_config_t alarm_cfg = {
-        .alarm_count = now + half,
-        .reload_count = 0,
-        .flags = { .auto_reload_on_alarm = false },
-    };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(step_timer, &alarm_cfg));
-    ESP_ERROR_CHECK(gptimer_start(step_timer));
+void set_direction(int motor_num, int dir) {
+    if (dir == CW_DIR) {
+        current_dir = CW_DIR;
+    } else {
+        current_dir = CCW_DIR;
+    }
+    ESP_LOGI(TAG, "Set Direction -> %s", current_dir == CW_DIR ? "CW" : "CCW");
+    if (motor_num == MOTOR_1) {
+        gpio_set_level(REFR_DIR_1, current_dir);
+    } else if (motor_num == MOTOR_2) {
+        gpio_set_level(REFR_DIR_2, current_dir);
+    } else {
+        ESP_LOGI(TAG, "Invalid motor number: %d", motor_num);
+        return;
+    }
 }
 
-void stepper_stop_continuous(void)
-{
-    g_run_enabled = false; // ISR will stop at next falling edge
-    vTaskDelay(ms_to_ticks(100));
-    gpio_set_level(RELAY_BREAK_A_PIN, 0);
+int get_direction(void) {
+    return current_dir;
 }
 
-static void gpio_init_step_dir(void)
-{
+void toggle_direction(void) {
+    if (current_dir == CW_DIR) {
+        current_dir = CCW_DIR;
+    } else {
+        current_dir = CW_DIR;
+    }
+    ESP_LOGI(TAG, "Toggle Direction -> %s", current_dir == CW_DIR ? "CW" : "CCW");
+    gpio_set_level(REFR_DIR_1, current_dir);
+}
+
+void break_control(int break_on_off) {
+    if (break_on_off == 1) {
+        gpio_set_level(RELAY_BREAK_A_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        gpio_set_level(RELAY_BREAK_A_PIN, 0);
+    }
+}
+
+void stepper_start_continuous(int motor_num, int dir) {
+
+    if (motor_num == MOTOR_1) {
+        stepper_timer_init_once_1();
+    } else if (motor_num == MOTOR_2) {
+        // stepper_timer_init_once_2();
+    } else {
+        ESP_LOGI(TAG, "Invalid motor number: %d", motor_num);
+        return;
+    }
+
+    set_direction(motor_num, dir);
+
+    if (motor_num == MOTOR_1) {
+        gpio_set_level(REFL_STEP_1, 0);
+        hw_step_state_high_1 = false;
+        hw_steps_remaining_1 = -1; // continuous
+        g_run_enabled_1 = true;
+
+        uint64_t now = 0;
+        ESP_ERROR_CHECK(gptimer_get_raw_count(step_timer_1, &now));
+        uint64_t half = (uint64_t)(hw_current_period_us_1 >> 1);
+        if (half == 0) half = 1;
+        gptimer_alarm_config_t alarm_cfg = {
+            .alarm_count = now + half,
+            .reload_count = 0,
+            .flags = { .auto_reload_on_alarm = false },
+        };
+        ESP_ERROR_CHECK(gptimer_set_alarm_action(step_timer_1, &alarm_cfg));
+        ESP_ERROR_CHECK(gptimer_start(step_timer_1));
+    } else if (motor_num == MOTOR_2) {
+        gpio_set_level(REFL_STEP_2, 0);
+        hw_step_state_high_2 = false;
+        hw_steps_remaining_2 = -1; // continuous
+        g_run_enabled_2 = true;
+
+        uint64_t now = 0;
+        ESP_ERROR_CHECK(gptimer_get_raw_count(step_timer_2, &now));
+        uint64_t half = (uint64_t)(hw_current_period_us_2 >> 1);
+        if (half == 0) half = 1;
+        gptimer_alarm_config_t alarm_cfg = {
+            .alarm_count = now + half,
+            .reload_count = 0,
+            .flags = { .auto_reload_on_alarm = false },
+        };
+        ESP_ERROR_CHECK(gptimer_set_alarm_action(step_timer_1, &alarm_cfg));
+        ESP_ERROR_CHECK(gptimer_start(step_timer_1));
+    } else {
+        ESP_LOGI(TAG, "Invalid motor number: %d", motor_num);
+        return;
+    }
+
+    
+}
+
+void stepper_stop_continuous(int motor_num) {
+    if (motor_num == MOTOR_1) {
+        g_run_enabled_1 = false; // ISR will stop at next falling edge
+    } else if (motor_num == MOTOR_2) {
+        g_run_enabled_2 = false; // ISR will stop at next falling edge
+    } else {
+        ESP_LOGI(TAG, "Invalid motor number: %d", motor_num);
+        return;
+    }
+}
+
+static void gpio_init_step_dir(void) {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << REFL_STEP) | (1ULL << REFR_DIR),
+        .pin_bit_mask = (1ULL << REFL_STEP_1) | (1ULL << REFR_DIR_1) | (1ULL << REFL_STEP_2) | (1ULL << REFR_DIR_2),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
-    gpio_set_level(REFL_STEP, 0);
-    gpio_set_level(REFR_DIR, 0);
+    gpio_set_level(REFL_STEP_1, 0);
+    gpio_set_level(REFR_DIR_1, 0);
+    gpio_set_level(REFL_STEP_2, 0);
+    gpio_set_level(REFR_DIR_2, 0);
 
     if (DRV_ENN_PIN >= 0) {
         gpio_config_t en_conf = {
@@ -748,4 +859,212 @@ void check_tmc5160_status(void) {
     } else {
         ESP_LOGI(TAG, "  ✗ MRES setting is wrong! Expected: %d, Actual: %d", expected_mres, mres);
     }
+}
+
+// 정확한 스텝 수만큼 이동
+void stepper_move_steps(int motor_num, int steps, int dir, float rpm) {
+    if (steps <= 0) return;
+    
+    ESP_LOGI(TAG, "Moving %d steps in direction %s at %.1f RPM", 
+             steps, (dir == CW_DIR) ? "CW" : "CCW", rpm);
+    
+    // 속도 설정
+    set_target_rpm(motor_num, rpm);
+    set_direction(motor_num, dir);
+    
+    // 스텝 주기 계산
+    uint32_t period_us = rpm_to_period_us(rpm);
+
+    int motor_step_pin;
+    
+    if (motor_num == 1) {
+        motor_step_pin = REFL_STEP_1;
+    } else if (motor_num == 2) {
+        motor_step_pin = REFL_STEP_2;
+    } else {
+        ESP_LOGI(TAG, "Invalid motor number: %d", motor_num);
+        return;
+    }
+    // 각 스텝마다 신호 생성
+    for (int i = 0; i < steps; i++) {
+        // STEP 신호 생성 (HIGH -> LOW)
+        gpio_set_level(motor_step_pin, 1);
+        esp_rom_delay_us(1);  // 1µs HIGH
+        gpio_set_level(motor_step_pin, 0);
+        
+        // 위치 업데이트
+        if (dir == CW_DIR) {
+            g_current_position++;
+        } else {
+            g_current_position--;
+        }
+        
+        // 스텝 주기만큼 대기
+        esp_rom_delay_us(period_us);
+    }
+    
+    ESP_LOGI(TAG, "Move complete. Current position: %d", g_current_position);
+}
+
+// 정확한 회전 수만큼 이동
+void stepper_move_rotations(int motor_num, float rotations, int dir, float rpm) {
+    const int fullsteps_per_rev = 200;
+    int steps_per_rev = fullsteps_per_rev * MICROSTEPS;
+    int total_steps = (int)(rotations * steps_per_rev);
+    
+    ESP_LOGI(TAG, "Moving %.2f rotations (%d steps) in direction %s at %.1f RPM", 
+             rotations, total_steps, (dir == CW_DIR) ? "CW" : "CCW", rpm);
+    
+    stepper_move_steps(motor_num, total_steps, dir, rpm);
+}
+
+// 절대 위치로 이동
+void stepper_move_to_position(int motor_num, int target_position, float rpm) {
+    int steps_to_move = target_position - g_current_position;
+    int dir = (steps_to_move > 0) ? CW_DIR : CCW_DIR;
+    
+    if (steps_to_move != 0) {
+        ESP_LOGI(TAG, "Moving from position %d to %d (%d steps)", 
+                 g_current_position, target_position, abs(steps_to_move));
+        stepper_move_steps(motor_num, abs(steps_to_move), dir, rpm);
+    }
+}
+
+
+
+// 모터 동작 테스트 함수 (시간 기반 - 부정확)
+void motor_test_sequence(void) {
+    ESP_LOGI(TAG, "=== Motor Test Sequence Start ===");
+    
+    // 1초 동안 시계방향으로 3바퀴 (180 RPM)
+    ESP_LOGI(TAG, "Phase 1: Clockwise 3 rotations (180 RPM)");
+    
+    break_control(1);
+    set_target_rpm(MOTOR_1, 180.0f);
+    stepper_start_continuous(MOTOR_1, CW_DIR);
+    vTaskDelay(pdMS_TO_TICKS(1000));  // 1초 대기
+    stepper_stop_continuous(MOTOR_1);
+    
+    // 잠시 정지
+    ESP_LOGI(TAG, "Pause for 500ms");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // 1초 동안 반시계방향으로 3바퀴 (180 RPM)
+    ESP_LOGI(TAG, "Phase 2: Counter-clockwise 3 rotations (180 RPM)");
+    set_target_rpm(MOTOR_1, 180.0f*2);
+    stepper_start_continuous(MOTOR_1, CCW_DIR);
+    vTaskDelay(pdMS_TO_TICKS(500));  // 1초 대기
+    stepper_stop_continuous(MOTOR_1);
+    
+    ESP_LOGI(TAG, "=== Motor Test Sequence Complete ===");
+}
+
+// 정확한 위치 제어 테스트 함수
+void motor_precise_test_sequence(void) {
+    ESP_LOGI(TAG, "=== Precise Motor Test Sequence Start ===");
+    
+    // 브레이크 해제
+    break_control(1);
+    
+    // Phase 1: 정확히 3바퀴 시계방향으로 이동
+    ESP_LOGI(TAG, "Phase 1: Precise 3 rotations clockwise");
+    stepper_move_rotations(MOTOR_1, 2.0f, CW_DIR, 180.0f);
+    
+    // 잠시 정지
+    ESP_LOGI(TAG, "Pause for 500ms");
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
+    // Phase 2: 정확히 3바퀴 반시계방향으로 이동 (원점 복귀)
+    ESP_LOGI(TAG, "Phase 2: Precise 3 rotations counter-clockwise (return to origin)");
+    stepper_move_rotations(MOTOR_1, 2.0f, CCW_DIR, 240.0f * 2);
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
+    ESP_LOGI(TAG, "=== Precise Motor Test Sequence Complete ===");
+    ESP_LOGI(TAG, "Final position: %d", g_current_position);
+}
+
+// 1rpm에서 300rpm까지의 스텝을 점차 좁혀가면서 속도를 증가 시키는 함수
+void motor_step_acceleration_test_sequence(void) {
+    ESP_LOGI(TAG, "=== Motor Step Acceleration Test Sequence Start ===");
+    
+    // 브레이크 해제
+    break_control(1);
+    
+    // 가속 구간: 1rpm에서 300rpm까지 점진적 증가 (한 바퀴 동안)
+    ESP_LOGI(TAG, "Phase 1: Acceleration from 1 RPM to 300 RPM (one full rotation)");
+    
+    const int fullsteps_per_rev = 200;
+    int steps_per_rev = fullsteps_per_rev * MICROSTEPS;  // 3,200 스텝 (16 마이크로스텝)
+    
+    ESP_LOGI(TAG, "Steps per revolution: %d (microsteps: %d)", steps_per_rev, MICROSTEPS);
+    
+    for (int step = 0; step < steps_per_rev; step++) {
+        // 현재 스텝에 해당하는 RPM 계산 (선형 증가)
+        float current_rpm = 1.0f + ((300.0f - 1.0f) * step / (float)(steps_per_rev - 1));
+        
+        // 현재 RPM에 해당하는 스텝 주기 계산
+        uint32_t period_us = rpm_to_period_us(current_rpm);
+        
+        // STEP 신호 생성
+        gpio_set_level(REFL_STEP_1, 1);
+        esp_rom_delay_us(1);
+        gpio_set_level(REFL_STEP_1, 0);
+        
+        // 위치 업데이트
+        g_current_position++;
+        
+        // 현재 RPM에 해당하는 주기만큼 대기
+        esp_rom_delay_us(period_us);
+        
+        // 400 스텝마다 로그 출력 (1/8 회전마다)
+        if (step % 400 == 0) {
+            ESP_LOGI(TAG, "Acceleration: Step %d/%d, RPM: %.1f, Period: %lu µs, Position: %d", 
+                     step, steps_per_rev, current_rpm, period_us, g_current_position);
+        }
+    }
+    
+    // 등속 구간: 300rpm으로 한 바퀴 유지
+    ESP_LOGI(TAG, "Phase 2: Constant speed at 300 RPM (one full rotation)");
+    uint32_t constant_period_us = rpm_to_period_us(300.0f);
+    
+    for (int i = 0; i < steps_per_rev; i++) {  // 한 바퀴 동안 300rpm 유지
+        gpio_set_level(REFL_STEP_1, 1);
+        esp_rom_delay_us(1);
+        gpio_set_level(REFL_STEP_1, 0);
+        
+        g_current_position++;
+        esp_rom_delay_us(constant_period_us);
+        
+        // 400 스텝마다 로그 출력 (1/8 회전마다)
+        if (i % 400 == 0) {
+            ESP_LOGI(TAG, "Constant: 300 RPM, Step: %d/%d, Position: %d", i, steps_per_rev, g_current_position);
+        }
+    }
+    
+    // 감속 구간: 300rpm에서 1rpm까지 점진적 감소 (한 바퀴 동안)
+    ESP_LOGI(TAG, "Phase 3: Deceleration from 300 RPM to 1 RPM (one full rotation)");
+    
+    for (int step = 0; step < steps_per_rev; step++) {
+        // 현재 스텝에 해당하는 RPM 계산 (선형 감소)
+        float current_rpm = 300.0f - ((300.0f - 1.0f) * step / (float)(steps_per_rev - 1));
+        
+        uint32_t period_us = rpm_to_period_us(current_rpm);
+        
+        gpio_set_level(REFL_STEP_1, 1);
+        esp_rom_delay_us(1);
+        gpio_set_level(REFL_STEP_1, 0);
+        
+        g_current_position++;
+        esp_rom_delay_us(period_us);
+        
+        // 400 스텝마다 로그 출력 (1/8 회전마다)
+        if (step % 400 == 0) {
+            ESP_LOGI(TAG, "Deceleration: Step %d/%d, RPM: %.1f, Period: %lu µs, Position: %d", 
+                     step, steps_per_rev, current_rpm, period_us, g_current_position);
+        }
+    }
+    
+    ESP_LOGI(TAG, "=== Motor Step Acceleration Test Sequence Complete ===");
+    ESP_LOGI(TAG, "Final position: %d", g_current_position);
 }
